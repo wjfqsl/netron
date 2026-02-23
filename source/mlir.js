@@ -4036,28 +4036,23 @@ _.Parser = class {
     parseOptionalAttribute(type) {
         switch (this.getToken().kind) {
             case _.Token.at_identifier:
-            case _.Token.percent_identifier:
-            case _.Token.integer:
             case _.Token.floatliteral:
+            case _.Token.integer:
             case _.Token.hash_identifier:
-            case _.Token.l_square:
-            case _.Token.l_brace:
-            case _.Token.less:
-            case _.Token.string:
-                return this.parseAttribute(type);
-            case _.Token.minus:
-            case _.Token.kw_loc:
             case _.Token.kw_affine_map:
             case _.Token.kw_affine_set:
             case _.Token.kw_dense:
             case _.Token.kw_dense_resource:
-            case _.Token.kw_array:
-            case _.Token.kw_sparse:
-            case _.Token.kw_strided:
-            case _.Token.kw_distinct:
-            case _.Token.kw_unit:
-            case _.Token.kw_true:
             case _.Token.kw_false:
+            case _.Token.kw_loc:
+            case _.Token.kw_sparse:
+            case _.Token.kw_true:
+            case _.Token.kw_unit:
+            case _.Token.l_brace:
+            case _.Token.l_square:
+            case _.Token.less:
+            case _.Token.minus:
+            case _.Token.string:
                 return this.parseAttribute(type);
             default: {
                 const value = this.parseOptionalType(type);
@@ -4098,12 +4093,6 @@ _.Parser = class {
             throw new mlir.Error(`Expected integer value ${this.location()}`);
         }
         return result;
-    }
-
-    parseString() {
-        const value = this.getToken().getSpelling().str();
-        this.consumeToken(_.Token.string);
-        return value;
     }
 
     parseOptionalVerticalBar() {
@@ -5406,6 +5395,14 @@ _.AsmParser = class extends _.Parser {
             // parser.state.asmState.addUses(SymbolRefAttr::get(result), atToken.getLocRange())
         }
         return result;
+    }
+
+    parseString() {
+        const value = this.parseOptionalString();
+        if (value === null) {
+            throw new mlir.Error(`Expected string ${this.location()}`);
+        }
+        return value;
     }
 };
 
@@ -7199,10 +7196,8 @@ _.BytecodeReader = class {
             let type = null;
             let location = null;
             if (this.version.value >= 4) { // kElideUnknownBlockArgLocation
-                const typeAndLocation = reader.parseVarInt().toNumber();
-                const typeIdx = typeAndLocation >> 1;
-                const hasLocation = (typeAndLocation & 1) === 1;
-                type = this.attrTypeReader.readType(typeIdx);
+                const [typeIdx, hasLocation] = reader.parseVarIntWithFlag();
+                type = this.attrTypeReader.readType(typeIdx.toNumber());
                 if (hasLocation) {
                     const locIdx = reader.parseVarInt().toNumber();
                     location = this.attrTypeReader.readAttribute(locIdx);
@@ -8420,6 +8415,7 @@ _.Dialect = class {
         this.registerCustomAttribute('TypedStrAttr', this.parseTypedAttrInterface.bind(this));
         this.registerCustomAttribute('LevelAttr', (parser) => parser.parseAttribute(new _.IntegerType('index')));
         this.registerCustomType('Optional', this.parseOptional.bind(this));
+        this.registerCustomType('AnyTypeOf', (parser) => parser.parseType());
         for (const metadata of operations.get(name) || []) {
             this.registerOperandName(metadata.name, metadata);
         }
@@ -14355,11 +14351,17 @@ _.IREEVectorExtDialect = class extends _.Dialect {
                 }
                 parser.parseOptionalComma();
             }
+            const indexed = [];
             const unresolvedIndexVecs = [];
             const indexVecTypes = [];
             if (parser.parseOptionalLSquare()) {
                 while (!parser.getToken().is(_.Token.colon) && !parser.getToken().is(_.Token.r_square)) {
-                    unresolvedIndexVecs.push(parser.parseOperand());
+                    if (parser.parseOptionalKeyword('None')) {
+                        indexed.push(false);
+                    } else if (parser.getToken().is(_.Token.percent_identifier)) {
+                        unresolvedIndexVecs.push(parser.parseOperand());
+                        indexed.push(true);
+                    }
                     parser.parseOptionalComma();
                 }
                 if (unresolvedIndexVecs.length > 0) {
@@ -14373,6 +14375,7 @@ _.IREEVectorExtDialect = class extends _.Dialect {
                 }
                 parser.parseToken(_.Token.r_square, "expected ']'");
             }
+            result.addAttribute('indexed', indexed);
             parser.parseComma();
             const padding = parser.parseAttribute();
             result.addAttribute('padding', padding);
@@ -17650,21 +17653,28 @@ _.ArithDialect = class extends _.Dialect {
 
     parseSelectOp(parser, result) {
         const unresolvedOperands = parser.parseOperandList();
-        parser.parseOptionalAttrDict(result.attributes);
+        if (parser.getToken().is(_.Token.l_brace)) {
+            parser.parseAttributeDict(result.attributes);
+        }
         if (parser.parseOptionalColon()) {
-            const firstType = parser.parseType();
+            const condType = parser.parseType();
             if (parser.parseOptionalComma()) {
-                const conditionType = firstType;
                 const resultType = parser.parseType();
-                const types = [conditionType, resultType, resultType];
+                const types = [condType, resultType, resultType];
                 parser.resolveOperands(unresolvedOperands, types, result.operands);
-                result.addTypes([resultType]);
+                if (result.types.length > 0) {
+                    result.types[0] = resultType;
+                } else {
+                    result.addTypes([resultType]);
+                }
             } else {
-                const resultType = firstType;
-                const conditionType = new _.IntegerType('i1');
-                const types = [conditionType, resultType, resultType];
+                const types = unresolvedOperands.map(() => condType);
                 parser.resolveOperands(unresolvedOperands, types, result.operands);
-                result.addTypes([resultType]);
+                if (result.types.length > 0) {
+                    result.types[0] = condType;
+                } else {
+                    result.addTypes([condType]);
+                }
             }
         } else {
             for (const operand of unresolvedOperands) {
@@ -17790,13 +17800,12 @@ _.BuiltinDialect = class extends _.Dialect {
             }
             case 20: { // VectorTypeWithScalableDims
                 const numScalable = reader.readVarInt();
-                const scalableDims = [];
                 for (let i = 0; i < numScalable; i++) {
-                    scalableDims.push(reader.readByte() !== 0);
+                    reader.readByte(); // scalableDims flags
                 }
                 const shape = reader.readSignedVarInts();
                 const elementType = reader.readType();
-                return new _.VectorType(shape, elementType, scalableDims);
+                return new _.VectorType(shape, elementType);
             }
             default:
                 throw new mlir.Error(`Unsupported built-in type code '${typeCode}'.`);
@@ -17888,8 +17897,8 @@ _.BuiltinDialect = class extends _.Dialect {
                 return new _.FloatAttr(type, value);
             }
             case 10: { // CallSiteLoc
-                const callee = reader.readAttribute();
                 const caller = reader.readAttribute();
+                const callee = reader.readAttribute();
                 const callerStr = caller && caller.value ? caller.value : '<caller>';
                 const calleeStr = callee && callee.value ? callee.value : '<callee>';
                 return { name: 'loc', value: `callsite(${callerStr} at ${calleeStr})` };
@@ -17910,13 +17919,13 @@ _.BuiltinDialect = class extends _.Dialect {
                 return { name: 'loc', value: `fused[${locations.join(', ')}]` };
             }
             case 13: { // FusedLocWithMetadata
+                const metadata = reader.readAttribute();
                 const count = reader.readVarInt();
                 const locations = [];
                 for (let i = 0; i < count; i++) {
                     const loc = reader.readAttribute();
                     locations.push(loc && loc.value ? loc.value : '<loc>');
                 }
-                const metadata = reader.readAttribute();
                 const metaStr = metadata && metadata.value !== undefined ? metadata.value : '<meta>';
                 return { name: 'loc', value: `fused<${metaStr}>[${locations.join(', ')}]` };
             }
@@ -17950,12 +17959,7 @@ _.BuiltinDialect = class extends _.Dialect {
             case 19: { // DenseStringElementsAttr
                 const type = reader.readType();
                 const isSplat = reader.readVarInt() !== 0;
-                let count = 0;
-                if (isSplat) {
-                    count = 1;
-                } else if (type && type.getNumElements) {
-                    count = type.getNumElements();
-                }
+                const count = reader.readVarInt();
                 const strings = [];
                 for (let i = 0; i < count; i++) {
                     strings.push(reader.readString());
@@ -18167,6 +18171,7 @@ _.SCFDialect = class extends _.Dialect {
             return false;
         }
         parser.resolveOperands([unresolvedLb, unresolvedUb, unresolvedStep], [indexType, indexType, indexType], result.operands);
+        let initArgsCount = 0;
         if (parser.parseOptionalKeyword('iter_args')) {
             const unresolvedIterArgs = [];
             if (parser.parseOptionalLParen()) {
@@ -18190,6 +18195,7 @@ _.SCFDialect = class extends _.Dialect {
             result.addTypes(parser.parseArrowTypeList());
             const iterArgTypes = result.types.map((t) => t || indexType);
             parser.resolveOperands(unresolvedIterArgs, iterArgTypes, result.operands);
+            initArgsCount = unresolvedIterArgs.length;
         }
         if (parser.parseOptionalColon()) {
             parser.parseType();
@@ -18210,6 +18216,7 @@ _.SCFDialect = class extends _.Dialect {
             result.regions.push(region);
         }
         parser.parseOptionalAttrDict(result.attributes);
+        result.addAttribute('operandSegmentSizes', new _.DenseI32ArrayAttr([1, 1, 1, initArgsCount]));
         return true;
     }
 
